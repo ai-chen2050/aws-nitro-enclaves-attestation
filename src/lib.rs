@@ -32,6 +32,8 @@ use openssl::bn::BigNumContext;
 use openssl::ec::*;
 use openssl::nid::Nid;
 
+use json::{object, JsonValue};
+
 static ALL_SIGALGS: &[&webpki::SignatureAlgorithm] = &[
     &webpki::ECDSA_P256_SHA256,
     &webpki::ECDSA_P256_SHA384,
@@ -95,6 +97,7 @@ pub enum NitroAdError {
     CBORError(serde_cbor::Error),
     VerificationError(webpki::Error),
     SerializationError(serde_json::Error),
+    X509Error(String),
     Error(String),
 }
 
@@ -130,6 +133,7 @@ impl From<serde_json::Error> for NitroAdError {
 
 pub struct NitroAdDoc {
     payload_ref: NitroAdDocPayload,
+    verify_err: Option<webpki::Error>,
 }
 
 impl NitroAdDoc {
@@ -206,7 +210,7 @@ impl NitroAdDoc {
         let time = webpki::Time::from_seconds_since_unix_epoch(unix_ts_sec);
 
         let cert = webpki::EndEntityCert::from(ee)?;
-        cert.verify_is_valid_tls_server_cert(ALL_SIGALGS, &anchors, interm_slices, time)?;
+        let verify_err = cert.verify_is_valid_tls_server_cert(ALL_SIGALGS, &anchors, interm_slices, time).err();
 
         let res = parse_x509_certificate(ee);
         match res {
@@ -244,14 +248,63 @@ impl NitroAdDoc {
 
         Ok(NitroAdDoc {
             payload_ref: ad_parsed,
+            verify_err: verify_err,
         })
     }
 
     pub fn to_json(&self) -> Result<String, NitroAdError> {
-        let str = serde_json::to_string(&self.payload_ref)?;
+        let json_ad = object!{
+            "module_id": self.payload_ref.module_id.clone(),
+            "digest": self.payload_ref.digest.clone(),
+            "timestamp": self.payload_ref.timestamp.to_string(),
+            "pcrs": pcrs_to_json(&self.payload_ref.pcrs),
+            "certs": x509s_to_json(&self.payload_ref.certificate, &self.payload_ref.cabundle)?,
+            "public_key": self.payload_ref.public_key.as_ref().map(|pk| base64::encode(pk)),
+            "user_data": self.payload_ref.user_data.as_ref().map(|ud| base64::encode(ud)),
+            "nonce": self.payload_ref.nonce.as_ref().map(|nc| base64::encode(nc)),
+            "verification_error": self.verify_err.map(|e| e.to_string()),
+        };
 
-        Ok(str)
+        Ok(json::stringify(json_ad))
     }
+
+    pub fn verification_error(&self) -> Option<webpki::Error> {
+        self.verify_err.clone()
+    }
+}
+
+fn pcrs_to_json(pcrs: &HashMap<u8, ByteBuf>) -> JsonValue {
+    let mapped = pcrs.iter()
+        .map(|(i, val)| (i.to_string(), hex::encode(&val)));
+
+    use std::iter::FromIterator;
+    JsonValue::Object(json::object::Object::from_iter(mapped))
+}
+
+fn x509_to_json(der: &ByteBuf) -> Result<JsonValue, NitroAdError> {
+    let (_, cert) = X509Certificate::from_der(&der)
+        .map_err(|e| NitroAdError::X509Error(e.to_string()))?;
+
+    Ok(object!{
+        "issuer": cert.issuer().to_string(),
+        "subject": cert.subject().to_string(),
+        "validity": {
+            "not_before": cert.validity().not_before.to_string(),
+            "not_after": cert.validity().not_after.to_string(),
+        },
+    })
+}
+
+fn x509s_to_json<'a>(cert: &ByteBuf, cabundle: &Vec<ByteBuf>) -> Result<Vec<JsonValue>, NitroAdError> {
+    let mut result: Vec<JsonValue> = Vec::new();
+
+    for der in cabundle {
+        result.push(x509_to_json(der)?);
+    }
+
+    result.push(x509_to_json(cert)?);
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -288,7 +341,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_broken_root_cert() { 
 
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
@@ -296,25 +348,26 @@ mod tests {
         let mut root_cert_copy = root_cert.clone();
 
         root_cert_copy[200] = 0xff;
-        let _nitro_addoc = NitroAdDoc::from_bytes(ad_blob, &root_cert_copy, 1614967200).unwrap(); // Mar 5 18:00:00 2021 GMT
+        let nitro_addoc = NitroAdDoc::from_bytes(ad_blob, &root_cert_copy, 1614967200).unwrap(); // Mar 5 18:00:00 2021 GMT
+        assert!(nitro_addoc.verification_error().is_some());
     }
 
     #[test]
-    #[should_panic]
     fn test_expired_ee_cert() { 
 
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
-        let _nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1618407754).unwrap(); 
+        let nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1618407754).unwrap(); 
+        assert!(nitro_addoc.verification_error().is_some());
     }
 
     #[test]
-    #[should_panic]
     fn test_notyetvalid_ee_cert() { 
 
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
-        let _nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1614947200).unwrap(); 
+        let nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1614947200).unwrap(); 
+        assert!(nitro_addoc.verification_error().is_some());
     }
 
     #[test]
