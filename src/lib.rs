@@ -16,7 +16,6 @@ use openssl::bn::BigNumContext;
 use openssl::ec::*;
 use openssl::nid::Nid;
 use openssl::pkey::PKey;
-use serde_bytes::ByteBuf;
 use x509_parser::prelude::*;
 
 static ALL_SIGALGS: &[&webpki::SignatureAlgorithm] = &[
@@ -94,7 +93,7 @@ impl AttestationProcess for AttestationDoc {
         // 'cabundle' with root cert replaced with our trusted hardcoded one
         let ee: &[u8] = &ad_parsed.certificate;
 
-        let interm: Vec<ByteBuf> = ad_parsed.cabundle.clone();
+        let interm = ad_parsed.cabundle.clone();
         let interm = &interm[1..]; // skip first (claimed root) cert
 
         let interm_slices: Vec<_> = interm.iter().map(|x| x.as_slice()).collect();
