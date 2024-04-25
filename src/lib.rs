@@ -12,9 +12,9 @@ use std::string::String;
 
 use aws_cose::crypto::Openssl;
 use aws_nitro_enclaves_cose as aws_cose;
-use hex;
+
+use chrono::offset::LocalResult;
 use openssl::pkey::PKey;
-use webpki;
 
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -77,7 +77,7 @@ where
     let map = peer_public
         .iter()
         .sorted()
-        .map(|(k, v)| (k, hex::encode(v.to_vec())));
+        .map(|(k, v)| (k, hex::encode(v)));
     serializer.collect_map(map)
 }
 
@@ -100,12 +100,14 @@ impl NitroAdDoc {
             .map_err(|err| anyhow::format_err!("{err}"))?;
         let ad_parsed: NitroAdDocPayload = serde_cbor::from_slice(&ad_payload)?;
 
-        anyhow::ensure!(ad_parsed.module_id.len() > 0, "module_id is empty");
+        anyhow::ensure!(!ad_parsed.module_id.is_empty(), "module_id is empty");
 
         anyhow::ensure!(ad_parsed.digest == "SHA384", "digest signature is unknown");
 
         // validate timestamp range
-        let ts_start = Utc.ymd(2020, 1, 1).and_hms(0, 0, 0);
+        let LocalResult::Single(ts_start) = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0) else {
+            unreachable!()
+        };
         let ts_end = Utc::now() + Duration::days(1);
         anyhow::ensure!(
             ad_parsed.timestamp > ts_start && ad_parsed.timestamp < ts_end,
@@ -216,7 +218,7 @@ mod tests {
     fn test_broken_root_cert() {
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
-        let mut root_cert_copy = root_cert.clone();
+        let mut root_cert_copy = *root_cert;
 
         root_cert_copy[200] = 0xff;
         NitroAdDoc::from_bytes(ad_blob, &root_cert_copy, 1614967200).unwrap(); // Mar 5 18:00:00 2021 GMT
@@ -243,7 +245,7 @@ mod tests {
     fn test_broken_some_cert_in_ad() {
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
-        let mut ad_blob_copy = ad_blob.clone();
+        let mut ad_blob_copy = *ad_blob;
 
         ad_blob_copy[0x99f] = 0xff;
         NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
@@ -254,7 +256,7 @@ mod tests {
     fn test_broken_ad_pcrx() {
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
-        let mut ad_blob_copy = ad_blob.clone();
+        let mut ad_blob_copy = *ad_blob;
 
         ad_blob_copy[0x13b] = 0xff;
         NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
@@ -267,7 +269,7 @@ mod tests {
 
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
-        let mut ad_blob_copy = ad_blob.clone();
+        let mut ad_blob_copy = *ad_blob;
 
         ad_blob_copy[0x281] = 0xff;
         NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
@@ -355,7 +357,7 @@ mod tests {
         let ec_public =
             openssl::ec::EcKey::from_public_key_affine_coordinates(&alg, &x, &y).unwrap();
         let ec_private =
-            openssl::ec::EcKey::from_private_components(&alg, &d, &ec_public.public_key()).unwrap();
+            openssl::ec::EcKey::from_private_components(&alg, &d, ec_public.public_key()).unwrap();
         (
             //PKey::from_ec_key(ec_private).unwrap(),
             //PKey::from_ec_key(ec_public).unwrap(),
