@@ -16,14 +16,13 @@ use aws_nitro_enclaves_cose as aws_cose;
 use chrono::offset::LocalResult;
 use openssl::pkey::PKey;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_bytes::ByteBuf;
 
 use chrono::prelude::*;
 use chrono::serde::ts_milliseconds;
 use chrono::{DateTime, Duration, Utc};
 
-use itertools::Itertools;
 use std::collections::HashMap;
 
 use x509_parser::prelude::*;
@@ -40,50 +39,30 @@ static ALL_SIGALGS: &[&webpki::SignatureAlgorithm] = &[
     &webpki::ED25519,
 ];
 
-#[derive(Debug, Serialize, Deserialize)]
-struct NitroAdDocPayload {
-    module_id: String,
-    digest: String,
+#[derive(Debug, Deserialize)]
+pub struct NitroAdDoc {
+    pub module_id: String,
+    pub digest: String,
 
     #[serde(with = "ts_milliseconds")]
-    timestamp: DateTime<Utc>,
+    pub timestamp: DateTime<Utc>,
 
-    #[serde(serialize_with = "ser_peer_public")]
-    pcrs: HashMap<u8, ByteBuf>,
-
-    #[serde(skip_serializing)]
-    certificate: ByteBuf,
+    pub pcrs: HashMap<u8, ByteBuf>,
 
     #[serde(skip_serializing)]
-    cabundle: Vec<ByteBuf>,
+    pub certificate: ByteBuf,
+
+    #[serde(skip_serializing)]
+    pub cabundle: Vec<ByteBuf>,
 
     // optional
-    #[serde(skip_serializing_if = "Option::is_none")]
-    public_key: Option<ByteBuf>,
+    pub public_key: Option<ByteBuf>,
 
     // optional
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_data: Option<ByteBuf>,
+    pub user_data: Option<ByteBuf>,
 
     // optional
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nonce: Option<ByteBuf>,
-}
-
-fn ser_peer_public<S>(peer_public: &HashMap<u8, ByteBuf>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    let map = peer_public
-        .iter()
-        .sorted()
-        .map(|(k, v)| (k, hex::encode(v)));
-    serializer.collect_map(map)
-}
-
-pub struct NitroAdDoc {
-    payload_ref: NitroAdDocPayload,
-    verify_err: Option<webpki::Error>,
+    pub nonce: Option<ByteBuf>,
 }
 
 impl NitroAdDoc {
@@ -98,7 +77,7 @@ impl NitroAdDoc {
         let ad_payload = ad_doc_cose
             .get_payload::<Openssl>(None)
             .map_err(|err| anyhow::format_err!("{err}"))?;
-        let ad_parsed: NitroAdDocPayload = serde_cbor::from_slice(&ad_payload)?;
+        let ad_parsed: NitroAdDoc = serde_cbor::from_slice(&ad_payload)?;
 
         anyhow::ensure!(!ad_parsed.module_id.is_empty(), "module_id is empty");
 
@@ -174,10 +153,7 @@ impl NitroAdDoc {
             .verify_signature::<Openssl>(&PKey::try_from(key)?)
             .map_err(|err| anyhow::format_err!("{err}"))?);
 
-        Ok(NitroAdDoc {
-            payload_ref: ad_parsed,
-            verify_err: None,
-        })
+        Ok(ad_parsed)
     }
 }
 
