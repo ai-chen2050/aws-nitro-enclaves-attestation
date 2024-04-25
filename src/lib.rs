@@ -8,28 +8,16 @@
 //!
 
 use std::convert::TryFrom;
-use std::string::String;
 
 use aws_cose::crypto::Openssl;
 use aws_nitro_enclaves_cose as aws_cose;
-
-use chrono::offset::LocalResult;
-use openssl::pkey::PKey;
-
-use serde::Deserialize;
-use serde_bytes::ByteBuf;
-
-use chrono::prelude::*;
-use chrono::serde::ts_milliseconds;
-use chrono::{DateTime, Duration, Utc};
-
-use std::collections::HashMap;
-
-use x509_parser::prelude::*;
-
+use aws_nitro_enclaves_nsm_api::api::{AttestationDoc, Digest};
 use openssl::bn::BigNumContext;
 use openssl::ec::*;
 use openssl::nid::Nid;
+use openssl::pkey::PKey;
+use serde_bytes::ByteBuf;
+use x509_parser::prelude::*;
 
 static ALL_SIGALGS: &[&webpki::SignatureAlgorithm] = &[
     &webpki::ECDSA_P256_SHA256,
@@ -39,62 +27,52 @@ static ALL_SIGALGS: &[&webpki::SignatureAlgorithm] = &[
     &webpki::ED25519,
 ];
 
-#[derive(Debug, Deserialize)]
-pub struct NitroAdDoc {
-    pub module_id: String,
-    pub digest: String,
-
-    #[serde(with = "ts_milliseconds")]
-    pub timestamp: DateTime<Utc>,
-
-    pub pcrs: HashMap<u8, ByteBuf>,
-
-    #[serde(skip_serializing)]
-    pub certificate: ByteBuf,
-
-    #[serde(skip_serializing)]
-    pub cabundle: Vec<ByteBuf>,
-
-    // optional
-    pub public_key: Option<ByteBuf>,
-
-    // optional
-    pub user_data: Option<ByteBuf>,
-
-    // optional
-    pub nonce: Option<ByteBuf>,
+pub trait AttestationProcess {
+    fn from_bytes(bytes: &[u8], root_cert: &[u8], unix_ts_sec: u64) -> anyhow::Result<Self>
+    where
+        Self: Sized;
 }
 
-impl NitroAdDoc {
-    pub fn from_bytes(bytes: &[u8], root_cert: &[u8], unix_ts_sec: u64) -> anyhow::Result<Self> {
-        let ad_doc_cose =
-            aws_cose::CoseSign1::from_bytes(bytes).map_err(|err| anyhow::format_err!("{err}"))?;
+pub const AWS_ROOT_CERT: &[u8] = include_bytes!("../tests/data/aws_root.der");
 
+impl AttestationProcess for AttestationDoc {
+    fn from_bytes(
+        bytes: &[u8],
+        root_cert: &[u8],
+        unix_ts_sec: u64,
+    ) -> anyhow::Result<AttestationDoc> {
         // for validation flow details see here:
         // https://github.com/aws/aws-nitro-enclaves-nsm-api/blob/main/docs/attestation_process.md
+        let ad_doc_cose =
+            aws_cose::CoseSign1::from_bytes(bytes).map_err(|err| anyhow::format_err!("{err}"))?;
 
         // no Signature checks for now - no key specified
         let ad_payload = ad_doc_cose
             .get_payload::<Openssl>(None)
             .map_err(|err| anyhow::format_err!("{err}"))?;
-        let ad_parsed: NitroAdDoc = serde_cbor::from_slice(&ad_payload)?;
+        // let ad_parsed: <AttestationDoc as AttestationProcess> = serde_cbor::from_slice(&ad_payload)?;
+        let ad_parsed = AttestationDoc::from_binary(&ad_payload)
+            .map_err(|err| anyhow::format_err!("{err:?}"))?;
 
         anyhow::ensure!(!ad_parsed.module_id.is_empty(), "module_id is empty");
 
-        anyhow::ensure!(ad_parsed.digest == "SHA384", "digest signature is unknown");
-
-        // validate timestamp range
-        let LocalResult::Single(ts_start) = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0) else {
-            unreachable!()
-        };
-        let ts_end = Utc::now() + Duration::days(1);
         anyhow::ensure!(
-            ad_parsed.timestamp > ts_start && ad_parsed.timestamp < ts_end,
-            "timestamp field has wrong value"
+            matches!(ad_parsed.digest, Digest::SHA384),
+            "digest signature is unknown"
         );
 
+        // validate timestamp range
+        // let LocalResult::Single(ts_start) = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0) else {
+        //     unreachable!()
+        // };
+        // let ts_end = Utc::now() + Duration::days(1);
+        // anyhow::ensure!(
+        //     ad_parsed.timestamp > ts_start && ad_parsed.timestamp < ts_end,
+        //     "timestamp field has wrong value"
+        // );
+
         // validate pcr map length
-        let pcrs_len = ad_parsed.pcrs.len() as u8;
+        let pcrs_len = ad_parsed.pcrs.len();
         anyhow::ensure!(
             (1..32).contains(&pcrs_len),
             "wrong number of PCRs in the map"
@@ -162,7 +140,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_payload_to_valid_json() -> anyhow::Result<()> {
+    fn test_valid_payload() -> anyhow::Result<()> {
         // current ee cert baked into the ../tests/data/nitro_ad_debug.bin attestation document has next time limits
         //
         // notBefore=Mar  5 17:01:49 2021 GMT
@@ -181,11 +159,7 @@ mod tests {
         let root_cert = include_bytes!("../tests/data/aws_root.der");
 
         // Mar 5 18:00:00 2021 GMT
-        let _nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1614967200)?;
-        // let js = nitro_addoc.to_json().unwrap();
-
-        // let _: serde::de::IgnoredAny = serde_json::from_str(&js)?; // test js is valid JSON string (by trying to parse it)
-
+        <AttestationDoc as AttestationProcess>::from_bytes(ad_blob, root_cert, 1614967200)?;
         Ok(())
     }
 
@@ -197,7 +171,8 @@ mod tests {
         let mut root_cert_copy = *root_cert;
 
         root_cert_copy[200] = 0xff;
-        NitroAdDoc::from_bytes(ad_blob, &root_cert_copy, 1614967200).unwrap(); // Mar 5 18:00:00 2021 GMT
+        <AttestationDoc as AttestationProcess>::from_bytes(ad_blob, &root_cert_copy, 1614967200)
+            .unwrap(); // Mar 5 18:00:00 2021 GMT
     }
 
     #[test]
@@ -205,7 +180,7 @@ mod tests {
     fn test_expired_ee_cert() {
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
-        NitroAdDoc::from_bytes(ad_blob, root_cert, 1618407754).unwrap();
+        <AttestationDoc as AttestationProcess>::from_bytes(ad_blob, root_cert, 1618407754).unwrap();
     }
 
     #[test]
@@ -213,7 +188,7 @@ mod tests {
     fn test_notyetvalid_ee_cert() {
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
-        NitroAdDoc::from_bytes(ad_blob, root_cert, 1614947200).unwrap();
+        <AttestationDoc as AttestationProcess>::from_bytes(ad_blob, root_cert, 1614947200).unwrap();
     }
 
     #[test]
@@ -224,7 +199,8 @@ mod tests {
         let mut ad_blob_copy = *ad_blob;
 
         ad_blob_copy[0x99f] = 0xff;
-        NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
+        <AttestationDoc as AttestationProcess>::from_bytes(&ad_blob_copy, root_cert, 1614967200)
+            .unwrap();
     }
 
     #[test]
@@ -235,7 +211,8 @@ mod tests {
         let mut ad_blob_copy = *ad_blob;
 
         ad_blob_copy[0x13b] = 0xff;
-        NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
+        <AttestationDoc as AttestationProcess>::from_bytes(&ad_blob_copy, root_cert, 1614967200)
+            .unwrap();
     }
 
     #[test]
@@ -248,7 +225,8 @@ mod tests {
         let mut ad_blob_copy = *ad_blob;
 
         ad_blob_copy[0x281] = 0xff;
-        NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
+        <AttestationDoc as AttestationProcess>::from_bytes(&ad_blob_copy, root_cert, 1614967200)
+            .unwrap();
     }
 
     #[test]
@@ -343,4 +321,4 @@ mod tests {
 }
 
 // cSpell:words chrono secp384r1
-// cSpell:ignore cose webpki pkey
+// cSpell:ignore cose webpki pkey cabundle interm
