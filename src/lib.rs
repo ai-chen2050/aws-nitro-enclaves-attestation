@@ -1,23 +1,23 @@
 //#![deny(missing_docs)]
 //#![deny(warnings)]
 
-//! This library is usefull for developing C/C++ AWS Nitro Enclave applications
+//! This library is useful for developing C/C++ AWS Nitro Enclave applications
 //! with custom functionality like enclave-to-enclave
 //! secure communication and mutual attestation.
 //!
 //!
 
-use std::fmt;
+use std::convert::TryFrom;
 use std::string::String;
 
-use aws_cose::error::COSEError;
+use aws_cose::crypto::Openssl;
 use aws_nitro_enclaves_cose as aws_cose;
 use hex;
+use openssl::pkey::PKey;
 use webpki;
 
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
-use serde_json;
 
 use chrono::prelude::*;
 use chrono::serde::ts_milliseconds;
@@ -32,22 +32,12 @@ use openssl::bn::BigNumContext;
 use openssl::ec::*;
 use openssl::nid::Nid;
 
-use json::{object, JsonValue};
-
 static ALL_SIGALGS: &[&webpki::SignatureAlgorithm] = &[
     &webpki::ECDSA_P256_SHA256,
     &webpki::ECDSA_P256_SHA384,
     &webpki::ECDSA_P384_SHA256,
     &webpki::ECDSA_P384_SHA384,
     &webpki::ED25519,
-    #[cfg(feature = "alloc")]
-    &webpki::RSA_PKCS1_2048_8192_SHA256,
-    #[cfg(feature = "alloc")]
-    &webpki::RSA_PKCS1_2048_8192_SHA384,
-    #[cfg(feature = "alloc")]
-    &webpki::RSA_PKCS1_2048_8192_SHA512,
-    #[cfg(feature = "alloc")]
-    &webpki::RSA_PKCS1_3072_8192_SHA384,
 ];
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,106 +81,53 @@ where
     serializer.collect_map(map)
 }
 
-#[derive(Debug)]
-pub enum NitroAdError {
-    COSEError(COSEError),
-    CBORError(serde_cbor::Error),
-    VerificationError(webpki::Error),
-    SerializationError(serde_json::Error),
-    X509Error(String),
-    Error(String),
-}
-
-impl fmt::Display for NitroAdError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "NitroAdError: ")
-    }
-}
-
-impl From<COSEError> for NitroAdError {
-    fn from(err: COSEError) -> NitroAdError {
-        NitroAdError::COSEError(err)
-    }
-}
-
-impl From<serde_cbor::Error> for NitroAdError {
-    fn from(err: serde_cbor::Error) -> NitroAdError {
-        NitroAdError::CBORError(err)
-    }
-}
-
-impl From<webpki::Error> for NitroAdError {
-    fn from(err: webpki::Error) -> NitroAdError {
-        NitroAdError::VerificationError(err)
-    }
-}
-
-impl From<serde_json::Error> for NitroAdError {
-    fn from(err: serde_json::Error) -> NitroAdError {
-        NitroAdError::SerializationError(err)
-    }
-}
-
 pub struct NitroAdDoc {
     payload_ref: NitroAdDocPayload,
     verify_err: Option<webpki::Error>,
 }
 
 impl NitroAdDoc {
-    pub fn from_bytes(
-        bytes: &[u8],
-        root_cert: &[u8],
-        unix_ts_sec: u64,
-    ) -> Result<Self, NitroAdError> {
-        let ad_doc_cose = aws_cose::COSESign1::from_bytes(bytes)?;
+    pub fn from_bytes(bytes: &[u8], root_cert: &[u8], unix_ts_sec: u64) -> anyhow::Result<Self> {
+        let ad_doc_cose =
+            aws_cose::CoseSign1::from_bytes(bytes).map_err(|err| anyhow::format_err!("{err}"))?;
 
         // for validation flow details see here:
         // https://github.com/aws/aws-nitro-enclaves-nsm-api/blob/main/docs/attestation_process.md
 
-        // no Signature checks for now - no key specified 
-        let ad_payload = ad_doc_cose.get_payload(None)?;
+        // no Signature checks for now - no key specified
+        let ad_payload = ad_doc_cose
+            .get_payload::<Openssl>(None)
+            .map_err(|err| anyhow::format_err!("{err}"))?;
         let ad_parsed: NitroAdDocPayload = serde_cbor::from_slice(&ad_payload)?;
 
-        (ad_parsed.module_id.len() > 0)
-            .then(|| ())
-            .ok_or(NitroAdError::Error(String::from("module_id is empty")))?;
+        anyhow::ensure!(ad_parsed.module_id.len() > 0, "module_id is empty");
 
-        (ad_parsed.digest == "SHA384")
-            .then(|| ())
-            .ok_or(NitroAdError::Error(String::from(
-                "digest signature is unknown",
-            )))?;
+        anyhow::ensure!(ad_parsed.digest == "SHA384", "digest signature is unknown");
 
         // validate timestamp range
         let ts_start = Utc.ymd(2020, 1, 1).and_hms(0, 0, 0);
         let ts_end = Utc::now() + Duration::days(1);
-        (ad_parsed.timestamp > ts_start && ad_parsed.timestamp < ts_end)
-            .then(|| ())
-            .ok_or(NitroAdError::Error(String::from(
-                "timestamp field has wrong value",
-            )))?;
+        anyhow::ensure!(
+            ad_parsed.timestamp > ts_start && ad_parsed.timestamp < ts_end,
+            "timestamp field has wrong value"
+        );
 
         // validate pcr map length
         let pcrs_len = ad_parsed.pcrs.len() as u8;
-        ((1..32).contains(&pcrs_len))
-            .then(|| ())
-            .ok_or(NitroAdError::Error(String::from(
-                "wrong number of PCRs in the map",
-            )))?;
+        anyhow::ensure!(
+            (1..32).contains(&pcrs_len),
+            "wrong number of PCRs in the map"
+        );
 
         // validate pcr items
         for i in 0..pcrs_len {
-            (ad_parsed.pcrs.contains_key(&i))
-                .then(|| ())
-                .ok_or(NitroAdError::Error(format!("PCR{} is missing", i)))?;
+            anyhow::ensure!(ad_parsed.pcrs.contains_key(&i), "PCR{i} is missing");
 
             let pcr_len = ad_parsed.pcrs[&i].len();
-            ([32, 48, 64].contains(&pcr_len))
-                .then(|| ())
-                .ok_or(NitroAdError::Error(format!(
-                    "PCR{} len is other than 32/48/64 bytes",
-                    i
-                )))?;
+            anyhow::ensure!(
+                [32, 48, 64].contains(&pcr_len),
+                "PCR{i} len is other than 32/48/64 bytes"
+            );
             //println!("prc{:2}:  {}", i, hex::encode( ad_parsed.pcrs[&i].to_vec() ) );
         }
 
@@ -210,101 +147,36 @@ impl NitroAdDoc {
         let time = webpki::Time::from_seconds_since_unix_epoch(unix_ts_sec);
 
         let cert = webpki::EndEntityCert::from(ee)?;
-        let verify_err = cert.verify_is_valid_tls_server_cert(ALL_SIGALGS, &anchors, interm_slices, time).err();
+        cert.verify_is_valid_tls_server_cert(ALL_SIGALGS, &anchors, interm_slices, time)?;
 
-        let res = parse_x509_certificate(ee);
-        match res {
-            Ok((rem, cert)) => {
-                (rem.is_empty())
-                    .then(|| ())
-                    .ok_or(NitroAdError::Error(String::from("rem isnot empty")))?;
+        let (rem, cert) = parse_x509_certificate(ee)?;
+        anyhow::ensure!(rem.is_empty(), "rem is not empty");
 
-                (cert.tbs_certificate.version == X509Version::V3)
-                    .then(|| ())
-                    .ok_or(NitroAdError::Error(String::from("wrong cert version")))?;
+        anyhow::ensure!(
+            cert.tbs_certificate.version == X509Version::V3,
+            "wrong cert version"
+        );
 
-                let ee_pub_key = cert.tbs_certificate.subject_pki.subject_public_key.data;
+        let ee_pub_key = cert.tbs_certificate.subject_pki.subject_public_key.data;
 
-                let group = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
-                let mut ctx = BigNumContext::new().unwrap();
-                let point = EcPoint::from_bytes(&group, &ee_pub_key, &mut ctx).unwrap();
-                let key = EcKey::from_public_key(&group, &point).unwrap();
+        let group = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
+        let mut ctx = BigNumContext::new().unwrap();
+        let point = EcPoint::from_bytes(&group, &ee_pub_key, &mut ctx).unwrap();
+        let key = EcKey::from_public_key(&group, &point).unwrap();
 
-                // [TODO] remove all above parse_x509_certificate() stuff and extract public key with webpki after issue
-                // https://github.com/briansmith/webpki/issues/85
-                // become fixed
+        // [TODO] remove all above parse_x509_certificate() stuff and extract public key with webpki after issue
+        // https://github.com/briansmith/webpki/issues/85
+        // become fixed
 
-                if !ad_doc_cose.verify_signature(&key)? {
-                    return Err(NitroAdError::COSEError(COSEError::UnimplementedError));  //should be SignatureError(openssl::error::ErrorStack)
-                }
-            }
-            _ => {
-                return Err(NitroAdError::Error(format!(
-                    "x509 parsing failed: {:?}",
-                    res
-                )))
-            }
-        }
+        anyhow::ensure!(ad_doc_cose
+            .verify_signature::<Openssl>(&PKey::try_from(key)?)
+            .map_err(|err| anyhow::format_err!("{err}"))?);
 
         Ok(NitroAdDoc {
             payload_ref: ad_parsed,
-            verify_err: verify_err,
+            verify_err: None,
         })
     }
-
-    pub fn to_json(&self) -> Result<String, NitroAdError> {
-        let json_ad = object!{
-            "module_id": self.payload_ref.module_id.clone(),
-            "digest": self.payload_ref.digest.clone(),
-            "timestamp": self.payload_ref.timestamp.to_string(),
-            "pcrs": pcrs_to_json(&self.payload_ref.pcrs),
-            "certs": x509s_to_json(&self.payload_ref.certificate, &self.payload_ref.cabundle)?,
-            "public_key": self.payload_ref.public_key.as_ref().map(|pk| base64::encode(pk)),
-            "user_data": self.payload_ref.user_data.as_ref().map(|ud| base64::encode(ud)),
-            "nonce": self.payload_ref.nonce.as_ref().map(|nc| base64::encode(nc)),
-            "verification_error": self.verify_err.map(|e| e.to_string()),
-        };
-
-        Ok(json::stringify(json_ad))
-    }
-
-    pub fn verification_error(&self) -> Option<webpki::Error> {
-        self.verify_err.clone()
-    }
-}
-
-fn pcrs_to_json(pcrs: &HashMap<u8, ByteBuf>) -> JsonValue {
-    let mapped = pcrs.iter()
-        .map(|(i, val)| (i.to_string(), hex::encode(&val)));
-
-    use std::iter::FromIterator;
-    JsonValue::Object(json::object::Object::from_iter(mapped))
-}
-
-fn x509_to_json(der: &ByteBuf) -> Result<JsonValue, NitroAdError> {
-    let (_, cert) = X509Certificate::from_der(&der)
-        .map_err(|e| NitroAdError::X509Error(e.to_string()))?;
-
-    Ok(object!{
-        "issuer": cert.issuer().to_string(),
-        "subject": cert.subject().to_string(),
-        "validity": {
-            "not_before": cert.validity().not_before.to_string(),
-            "not_after": cert.validity().not_after.to_string(),
-        },
-    })
-}
-
-fn x509s_to_json<'a>(cert: &ByteBuf, cabundle: &Vec<ByteBuf>) -> Result<Vec<JsonValue>, NitroAdError> {
-    let mut result: Vec<JsonValue> = Vec::new();
-
-    for der in cabundle {
-        result.push(x509_to_json(der)?);
-    }
-
-    result.push(x509_to_json(cert)?);
-
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -312,8 +184,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_payload_to_valid_json() -> Result<(), NitroAdError> {
-
+    fn test_payload_to_valid_json() -> anyhow::Result<()> {
         // current ee cert baked into the ../tests/data/nitro_ad_debug.bin attestation document has next time limits
         //
         // notBefore=Mar  5 17:01:49 2021 GMT
@@ -328,92 +199,88 @@ mod tests {
         // Then, issue next cmd to see notBefore & notAfter from ./_ee.der
         // $openssl x509 -startdate -enddate -noout -inform der -in ./_ee.der
 
-        
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
 
-        let nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1614967200)?; // Mar 5 18:00:00 2021 GMT
-        let js = nitro_addoc.to_json().unwrap();
+        // Mar 5 18:00:00 2021 GMT
+        let _nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1614967200)?;
+        // let js = nitro_addoc.to_json().unwrap();
 
-        let _: serde::de::IgnoredAny = serde_json::from_str(&js)?;  // test js is valid JSON string (by trying to parse it)
+        // let _: serde::de::IgnoredAny = serde_json::from_str(&js)?; // test js is valid JSON string (by trying to parse it)
 
         Ok(())
     }
 
     #[test]
-    fn test_broken_root_cert() { 
-
+    #[should_panic]
+    fn test_broken_root_cert() {
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
         let mut root_cert_copy = root_cert.clone();
 
         root_cert_copy[200] = 0xff;
-        let nitro_addoc = NitroAdDoc::from_bytes(ad_blob, &root_cert_copy, 1614967200).unwrap(); // Mar 5 18:00:00 2021 GMT
-        assert!(nitro_addoc.verification_error().is_some());
-    }
-
-    #[test]
-    fn test_expired_ee_cert() { 
-
-        let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
-        let root_cert = include_bytes!("../tests/data/aws_root.der");
-        let nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1618407754).unwrap(); 
-        assert!(nitro_addoc.verification_error().is_some());
-    }
-
-    #[test]
-    fn test_notyetvalid_ee_cert() { 
-
-        let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
-        let root_cert = include_bytes!("../tests/data/aws_root.der");
-        let nitro_addoc = NitroAdDoc::from_bytes(ad_blob, root_cert, 1614947200).unwrap(); 
-        assert!(nitro_addoc.verification_error().is_some());
+        NitroAdDoc::from_bytes(ad_blob, &root_cert_copy, 1614967200).unwrap(); // Mar 5 18:00:00 2021 GMT
     }
 
     #[test]
     #[should_panic]
-    fn test_broken_some_cert_in_ad() { 
+    fn test_expired_ee_cert() {
+        let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
+        let root_cert = include_bytes!("../tests/data/aws_root.der");
+        NitroAdDoc::from_bytes(ad_blob, root_cert, 1618407754).unwrap();
+    }
 
+    #[test]
+    #[should_panic]
+    fn test_notyetvalid_ee_cert() {
+        let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
+        let root_cert = include_bytes!("../tests/data/aws_root.der");
+        NitroAdDoc::from_bytes(ad_blob, root_cert, 1614947200).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_broken_some_cert_in_ad() {
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
         let mut ad_blob_copy = ad_blob.clone();
 
         ad_blob_copy[0x99f] = 0xff;
-        let _nitro_addoc = NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
+        NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
     }
 
     #[test]
     #[should_panic]
-    fn test_broken_ad_pcrx() { 
-
+    fn test_broken_ad_pcrx() {
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
         let mut ad_blob_copy = ad_blob.clone();
 
         ad_blob_copy[0x13b] = 0xff;
-        let _nitro_addoc = NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
+        NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
     }
 
     #[test]
     #[should_panic]
-    fn test_broken_ad_debug_pcrx() {   // mutate zero-filled PCR
+    fn test_broken_ad_debug_pcrx() {
+        // mutate zero-filled PCR
 
         let ad_blob = include_bytes!("../tests/data/nitro_ad_debug.bin");
         let root_cert = include_bytes!("../tests/data/aws_root.der");
         let mut ad_blob_copy = ad_blob.clone();
 
         ad_blob_copy[0x281] = 0xff;
-        let _nitro_addoc = NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
+        NitroAdDoc::from_bytes(&ad_blob_copy, root_cert, 1614967200).unwrap();
     }
 
     #[test]
-    fn cose_sign1_ec384_validate() {
+    fn cose_sign1_ec384_validate() -> anyhow::Result<()> {
         let (_, ec_public) = get_ec384_test_key();
 
         const TEXT: &[u8] = b"It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife.";
 
         // This output was validated against COSE-C implementation
-        let cose_doc = aws_cose::COSESign1::from_bytes(&[
+        let cose_doc = aws_cose::CoseSign1::from_bytes(&[
             0x84, /* Protected: {1: -35} */
             0x44, 0xA1, 0x01, 0x38, 0x22, /* Unprotected: {4: '11'} */
             0xA1, 0x04, 0x42, 0x31, 0x31, /* payload: */
@@ -436,9 +303,13 @@ mod tests {
             0x63, 0xD8, 0x0B, 0x3B, 0x55, 0x26, 0x25, 0xCF, 0x37, 0x9D, 0x1C, 0xBB, 0x9E, 0x51,
             0x38, 0xCC, 0xD0, 0x7A, 0x19, 0x31,
         ])
-        .unwrap();
+        .map_err(|err| anyhow::format_err!("{err}"))?;
 
-        assert_eq!(cose_doc.get_payload(Some(&ec_public)).unwrap(), TEXT);
+        let payload = cose_doc
+            .get_payload::<Openssl>(Some(&PKey::try_from(ec_public)?))
+            .map_err(|err| anyhow::format_err!("{err}"))?;
+        anyhow::ensure!(payload == TEXT);
+        Ok(())
     }
 
     #[test]
@@ -460,6 +331,7 @@ mod tests {
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+    use aws_cose::crypto::Openssl;
     use openssl::pkey::{Private, Public};
 
     /// Static SECP384R1/P-384 key to be used when cross-validating the implementation
@@ -491,3 +363,6 @@ mod tests {
         )
     }
 }
+
+// cSpell:words chrono secp384r1
+// cSpell:ignore cose webpki pkey
