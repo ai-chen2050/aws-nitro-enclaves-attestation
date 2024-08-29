@@ -136,6 +136,8 @@ impl AttestationProcess for AttestationDoc {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     #[test]
@@ -264,6 +266,28 @@ mod tests {
             .get_payload::<Openssl>(Some(&PKey::try_from(ec_public)?))
             .map_err(|err| anyhow::format_err!("{err}"))?;
         anyhow::ensure!(payload == TEXT);
+        Ok(())
+    }
+
+    #[test]
+    fn stress_cose_sign1_ec384_validate() -> anyhow::Result<()> {
+        for index in 0..5 {
+            let mut count = 0;
+            let start_time = Instant::now();
+            loop {
+                if start_time.elapsed() >= Duration::from_secs(10) {
+                    break;
+                }
+                count += 1;
+                cose_sign1_ec384_validate()?
+            }
+
+            println!(
+                "round {index}, txs {}, tps {}",
+                count,
+                count as f32 / 10.
+            );
+        }
         Ok(())
     }
 
